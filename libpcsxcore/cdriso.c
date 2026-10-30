@@ -28,6 +28,7 @@
 #include <assert.h>
 #include <errno.h>
 #include "zlib_wrapper.h"
+#include <sys/stat.h>
 #ifdef HAVE_CHD
 #include <libchdr/chd.h>
 #endif
@@ -36,7 +37,6 @@
 #define strcasecmp _stricmp
 #else
 #include <sys/types.h>
-#include <sys/stat.h>
 #include <unistd.h>
 #endif
 

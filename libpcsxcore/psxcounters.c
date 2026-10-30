@@ -583,7 +583,7 @@ void psxRcntInit()
 
 /******************************************************************************/
 
-s32 psxRcntFreeze( void *f, s32 Mode )
+s32 psxRcntFreeze( void *f, s32 Mode, int runtime )
 {
     u32 spuSyncCount = 0;
     u32 count;
@@ -598,7 +598,9 @@ s32 psxRcntFreeze( void *f, s32 Mode )
     if (Mode == 0)
     {
         rcnts[3].rate = 1;
-        for( i = 0; i < CounterQuantity - 1; ++i )
+        /* Portable states may need repair. A same-instance snapshot already
+         * has the exact rates and cycle origins; division would round them. */
+        for( i = 0; !runtime && i < CounterQuantity - 1; ++i )
         {
             _psxRcntWmode( i, rcnts[i].mode );
             count = (psxRegs.cycle - rcnts[i].cycleStart) / rcnts[i].rate;

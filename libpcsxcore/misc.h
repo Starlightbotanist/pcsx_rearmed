@@ -66,7 +66,11 @@ int CheckResetManualExe();
 int Load(const char *ExePath);
 
 int SaveState(const char *file);
+/* Load results: 0 success, -1 rejected before mutation, -2 interrupted restore. */
 int LoadState(const char *file);
+/* Restore trusted state captured by this running instance, without portable
+ * savestate compatibility repairs which can change live timing. */
+int LoadStateRuntime(const char *file);
 int CheckState(const char *file);
 
 void MiscShutdown();

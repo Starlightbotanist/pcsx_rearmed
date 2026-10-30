@@ -27,6 +27,9 @@
 #include "psxcounters.h"
 #include "psxevents.h"
 #include "sio.h"
+#ifdef HAVE_LIBRETRO
+#include "../frontend/main.h"
+#endif
 #include <sys/stat.h>
 
 #ifdef USE_LIBRETRO_VFS
@@ -403,25 +406,40 @@ void LoadMcds(char *mcd1, char *mcd2) {
 	LoadMcd(2, mcd2);
 }
 
-void SaveMcd(char *mcd, char *data, uint32_t adr, int size) {
+static int save_mcd(char *mcd, char *data, uint32_t adr, int size) {
 	FILE *f;
 
 	if (mcd == NULL || *mcd == 0 || strcmp(mcd, "none") == 0)
-		return;
+		return 1;
+	if (adr > MCD_SIZE || size < 0 || (uint32_t)size > MCD_SIZE - adr)
+		return 0;
 
 	f = fopen(mcd, "r+b");
 	if (f != NULL) {
 		int64_t sz = McdFileSize(mcd);
+		int64_t seek_result;
+		uint32_t offset = adr;
+		int ret;
 		if (sz == MCD_SIZE + 64)
-			fseek(f, adr + 64, SEEK_SET);
+			offset += 64;
 		else if (sz == MCD_SIZE + 3904)
-			fseek(f, adr + 3904, SEEK_SET);
-		else
-			fseek(f, adr, SEEK_SET);
+			offset += 3904;
+		seek_result = fseek(f, offset, SEEK_SET);
+#ifdef USE_LIBRETRO_VFS
+		/* rfseek returns the new position, while stdio fseek returns zero. */
+		ret = seek_result >= 0;
+#else
+		ret = seek_result == 0;
+#endif
+		if (!ret) {
+			fclose(f);
+			return 0;
+		}
 
-		fwrite(data + adr, 1, size, f);
-		fclose(f);
-		return;
+		ret = fwrite(data + adr, 1, size, f) == (size_t)size;
+		if (fclose(f) != 0)
+			ret = 0;
+		return ret;
 	}
 
 #if 0
@@ -434,6 +452,20 @@ void SaveMcd(char *mcd, char *data, uint32_t adr, int size) {
 #endif
 
 	ConvertMcd(mcd, data);
+	/* Conversion has no result. A later retry verifies a normal full write. */
+	return 0;
+}
+
+void SaveMcd(char *mcd, char *data, uint32_t adr, int size) {
+#ifdef HAVE_LIBRETRO
+	if (retro_frame_owns_prediction())
+		return;
+#endif
+	save_mcd(mcd, data, adr, size);
+}
+
+int SaveMcdRuntime(char *mcd, char *data, uint32_t adr, int size) {
+	return save_mcd(mcd, data, adr, size);
 }
 
 void CreateMcd(char *mcd) {

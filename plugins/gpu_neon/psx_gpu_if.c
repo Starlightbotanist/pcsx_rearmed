@@ -229,4 +229,61 @@ void renderer_set_config(const struct rearmed_cbs *cbs)
   }
 }
 
+/* Queues are drained before capture. Rasterizer blocks and spans are scratch;
+ * texture caches are derived from native VRAM and invalidated on restoration.
+ * Enhanced pixels and scanout ownership cannot be reconstructed that way. */
+struct gpu_snapshot {
+  struct psx_gpu gpu;
+  unsigned char renderer[offsetof(psx_gpu_struct, blocks)];
+  size_t enhancement_size;
+};
+
+size_t GPUsnapshot_size(void)
+{
+  if (!gpu.vram || !initialized ||
+      (gpu.state.enhancement_enable && !egpu.enhancement_buf_ptr))
+    return 0;
+  return sizeof(struct gpu_snapshot) +
+    (gpu.state.enhancement_enable ? ENHANCEMENT_BUF_SIZE : 0);
+}
+
+void GPUsnapshot_save(void *data)
+{
+  struct gpu_snapshot *state = data;
+  assert(egpu.num_blocks == 0);
+  state->gpu = gpu;
+  memcpy(state->renderer, &egpu, sizeof(state->renderer));
+  state->enhancement_size = gpu.state.enhancement_enable ? ENHANCEMENT_BUF_SIZE : 0;
+  if (state->enhancement_size)
+    memcpy(state + 1, egpu.enhancement_buf_ptr - 4096 / 2,
+      state->enhancement_size);
+}
+
+int GPUsnapshot_valid(const void *data)
+{
+  const struct gpu_snapshot *state = data;
+  return state->gpu.vram == gpu.vram && state->gpu.async == gpu.async &&
+    state->enhancement_size == (gpu.state.enhancement_enable ? ENHANCEMENT_BUF_SIZE : 0);
+}
+
+void GPUsnapshot_load(const void *data)
+{
+  const struct gpu_snapshot *state = data;
+  gpu = state->gpu;
+  GPUsnapshot_sync_state();
+  memcpy(&egpu, state->renderer, sizeof(state->renderer));
+  if (state->enhancement_size)
+    memcpy(egpu.enhancement_buf_ptr - 4096 / 2, state + 1,
+      state->enhancement_size);
+  egpu.dirty_textures_4bpp_mask = ~0u;
+  egpu.dirty_textures_8bpp_mask = ~0u;
+  egpu.dirty_textures_8bpp_alternate_mask = ~0u;
+
+  /* A speculative flip may have changed the frontend's output geometry and
+   * borrowed software framebuffer. Rebuild this derived output on next run. */
+  gpu.state.w_out_old = gpu.state.h_out_old = 0;
+  gpu.state.fb_dirty_display_area = 1;
+  gpu.state.dims_changed = 1;
+}
+
 // vim:ts=2:sw=2:expandtab

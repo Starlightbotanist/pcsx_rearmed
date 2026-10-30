@@ -861,9 +861,9 @@ int SaveState(const char *file) {
 	SaveFuncs.write(f, &u.spu_part2, u.spu_hdr.Size - sizeof(u.spu_hdr) - 512*1024);
 
 	sioFreeze(f, 1);
-	cdrFreeze(f, 1);
+	cdrFreeze(f, 1, 0);
 	psxHwFreeze(f, 1);
-	psxRcntFreeze(f, 1);
+	psxRcntFreeze(f, 1, 0);
 	mdecFreeze(f, 1);
 	ndrc_freeze(f, 1);
 	padFreeze(f, 1);
@@ -873,7 +873,7 @@ int SaveState(const char *file) {
 	return 0;
 }
 
-int LoadState(const char *file) {
+static int load_state(const char *file, int runtime) {
 	struct misc_save_data *misc = (void *)(psxRegs.ptrs.psxH + 0xf000);
 	u32 biosBranchCheckOld = psxRegs.biosBranchCheck;
 	u32 oldCP0sr = psxRegs.CP0.n.SR;
@@ -919,11 +919,16 @@ int LoadState(const char *file) {
 		goto cleanup;
 	}
 	oldhle = Config.HLE;
+	/* A runtime snapshot keeps its initialized BIOS and CPU resources. A
+	 * different HLE mode needs the ordinary load/reinitialization path. */
+	if (runtime && hle != oldhle)
+		goto cleanup;
+	result = -2; // subsequent failure can leave live state partially restored
 	Config.HLE = hle;
 
-	if (Config.HLE)
+	if (Config.HLE && !runtime)
 		psxBiosInit();
-	else if (oldhle)
+	else if (!Config.HLE && oldhle)
 		psxBiosResetTables();
 	psxBiosSetupStdio();
 
@@ -982,9 +987,10 @@ int LoadState(const char *file) {
 	}
 
 	sioFreeze(f, 0);
-	cdrFreeze(f, 0);
+	if (cdrFreeze(f, 0, runtime) < 0)
+		goto cleanup;
 	psxHwFreeze(f, 0);
-	psxRcntFreeze(f, 0);
+	psxRcntFreeze(f, 0, runtime);
 	mdecFreeze(f, 0);
 
 	if (Config.HLE != oldhle) {
@@ -1008,6 +1014,14 @@ cleanup:
 	memset(misc, 0xff, sizeof(*misc));
 	SaveFuncs.close(f);
 	return result;
+}
+
+int LoadState(const char *file) {
+	return load_state(file, 0);
+}
+
+int LoadStateRuntime(const char *file) {
+	return load_state(file, 1);
 }
 
 int CheckState(const char *file) {

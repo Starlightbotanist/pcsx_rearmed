@@ -48,6 +48,10 @@ int emu_core_preinit(void);
 int emu_core_init(void);
 
 void emu_core_ask_exit(void);
+#ifdef HAVE_LIBRETRO
+int retro_frame_is_speculative(void);
+int retro_frame_owns_prediction(void);
+#endif
 
 void emu_set_default_config(void);
 void emu_on_new_cd(int show_hud_msg);

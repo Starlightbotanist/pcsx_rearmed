@@ -1758,7 +1758,7 @@ void cdrReset() {
 	cdr.StatP |= STATUS_SHELLOPEN;
 }
 
-int cdrFreeze(void *f, int Mode) {
+int cdrFreeze(void *f, int Mode, int runtime) {
 	u32 tmp;
 	u8 tmpp[3];
 
@@ -1777,7 +1777,8 @@ int cdrFreeze(void *f, int Mode) {
 		getCdInfo();
 
 		cdr.FifoOffset = tmp < DATA_SIZE ? tmp : DATA_SIZE;
-		cdr.FifoSize = (cdr.Mode & MODE_SIZE_2340) ? 2340 : 2048 + 12;
+		if (!runtime)
+			cdr.FifoSize = (cdr.Mode & MODE_SIZE_2340) ? 2340 : 2048 + 12;
 		if (cdr.SubqForwardSectors > SUBQ_FORWARD_SECTORS)
 			cdr.SubqForwardSectors = SUBQ_FORWARD_SECTORS;
 
@@ -1789,8 +1790,12 @@ int cdrFreeze(void *f, int Mode) {
 			tmpp[2] = btoi(tmpp[2]);
 		}
 		cdr.Prev[0] = 0xff;
-		if (tmpp[0] != 0xff)
-			ReadTrack(tmpp);
+		if (tmpp[0] != 0xff && !ReadTrack(tmpp) && runtime && cdr.Reading)
+			return -1;
+		/* Refill the backend cache without changing the trusted saved latch.
+		 * An idle executable can legitimately have no readable disc sector. */
+		if (runtime)
+			memcpy(cdr.Prev, tmpp, sizeof(tmpp));
 
 		if (cdr.Play) {
 			if (cdr.freeze_ver < 0x63647202)

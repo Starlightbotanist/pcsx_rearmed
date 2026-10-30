@@ -52,7 +52,7 @@ u32 psxRcntRcount2();
 u32 psxRcntRmode(u32 index);
 u32 psxRcntRtarget(u32 index);
 
-s32 psxRcntFreeze(void *f, s32 Mode);
+s32 psxRcntFreeze(void *f, s32 Mode, int runtime);
 
 double psxGetFps();
 

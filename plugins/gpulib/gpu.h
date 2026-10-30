@@ -13,6 +13,7 @@
 
 #include <stdint.h>
 #include <string.h>
+#include "gpu_snapshot.h"
 #include "../../include/compiler_features.h"
 
 //#define RAW_FB_DISPLAY
@@ -198,6 +199,7 @@ void GPUwriteStatus(uint32_t data);
 long GPUfreeze(uint32_t type, struct GPUFreeze *freeze, uint16_t **vram_ptr);
 long GPUopen(unsigned long *disp, char *cap, char *cfg);
 long GPUclose(void);
+
 void GPUvBlank(int is_vblank, int lcf);
 void GPUgetScreenInfo(int *y, int *base_hres);
 void GPUrearmedCallbacks(const struct rearmed_cbs *cbs_);

@@ -1080,6 +1080,20 @@ uint32_t GPUreadStatus(void)
   return ret;
 }
 
+void GPUsnapshot_sync(void)
+{
+  if (gpu.cmd_len > 0) {
+    flush_cmd_buffer(&gpu);
+    sync_ecmds_status_bits(&gpu);
+  }
+  sync_renderer(&gpu);
+}
+
+void GPUsnapshot_sync_state(void)
+{
+  sync_renderer_ecmds(&gpu);
+}
+
 long GPUfreeze(uint32_t type, GPUFreeze_t *freeze, uint16_t **vram_ptr)
 {
   int i;

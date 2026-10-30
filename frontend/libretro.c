@@ -39,6 +39,9 @@
 #include "../libpcsxcore/gpu.h"
 #include "../libpcsxcore/sio.h"
 #include "../libpcsxcore/database.h"
+#ifdef GPU_NEON
+#include "../plugins/gpulib/gpu_snapshot.h"
+#endif
 #include "../plugins/dfsound/out.h"
 #include "../plugins/dfsound/spu_config.h"
 #include "cspace.h"
@@ -91,6 +94,40 @@
 #endif
 
 static bool reset_pending = false;
+static bool snapshot_game_loaded;
+static bool snapshot_restore_failed;
+static uint64_t snapshot_generation = 1;
+static enum retro_snapshot_execution_context (RETRO_CALLCONV *snapshot_context)(void);
+#ifdef GPU_NEON
+static void *snapshot_staging;
+static size_t snapshot_owners;
+static bool snapshot_commit_cards(void);
+#endif
+
+int retro_frame_is_speculative(void)
+{
+   return snapshot_context &&
+      snapshot_context() == RETRO_SNAPSHOT_SPECULATIVE;
+}
+
+int retro_frame_owns_prediction(void)
+{
+#ifdef GPU_NEON
+   return snapshot_staging && snapshot_context &&
+      snapshot_context() != RETRO_SNAPSHOT_ORDINARY;
+#else
+   return 0;
+#endif
+}
+
+static void snapshot_invalidate(void)
+{
+#ifdef GPU_NEON
+   if (snapshot_game_loaded)
+      GPUsnapshot_sync();
+#endif
+   snapshot_generation++;
+}
 
 static retro_video_refresh_t video_cb;
 static retro_input_poll_t input_poll_cb;
@@ -212,7 +249,11 @@ static bool axis_bounds_modifier;
 
 //Dummy functions
 bool retro_load_game_special(unsigned game_type, const struct retro_game_info *info, size_t num_info) { return false; }
-void retro_unload_game(void) {}
+void retro_unload_game(void)
+{
+   snapshot_invalidate();
+   snapshot_game_loaded = false;
+}
 static int vout_open(void) { return 0; }
 static void vout_close(void) {}
 static int snd_init(void) { return 0; }
@@ -808,7 +849,7 @@ void pl_timing_prepare(int is_pal)
 
 void plat_trigger_vibrate(int pad, int low, int high)
 {
-   if (!rumble_cb)
+   if (!rumble_cb || retro_frame_is_speculative())
       return;
 
    if (in_enable_vibration)
@@ -1179,6 +1220,7 @@ void retro_set_controller_port_device(unsigned port, unsigned device)
    if (port >= PORTS_NUMBER)
       return;
 
+   snapshot_invalidate();
    in_type_old = in_type[port];
    switch (device)
    {
@@ -1258,6 +1300,10 @@ struct save_fp
    int is_write;
 };
 
+static struct save_fp save_file;
+static size_t save_capacity;
+static bool save_failed;
+
 static void *save_open(const char *name, const char *mode)
 {
    struct save_fp *fp;
@@ -1265,9 +1311,7 @@ static void *save_open(const char *name, const char *mode)
    if (name == NULL || mode == NULL)
       return NULL;
 
-   fp = malloc(sizeof(*fp));
-   if (fp == NULL)
-      return NULL;
+   fp = &save_file;
 
    fp->buf = (char *)name;
    fp->pos = 0;
@@ -1282,6 +1326,12 @@ static int save_read(void *file, void *buf, u32 len)
    if (fp == NULL || buf == NULL)
       return -1;
 
+   if (fp->pos > save_capacity || len > save_capacity - fp->pos)
+   {
+      memset(buf, 0, len);
+      save_failed = true;
+      return -1;
+   }
    memcpy(buf, fp->buf + fp->pos, len);
    fp->pos += len;
    return len;
@@ -1293,6 +1343,11 @@ static int save_write(void *file, const void *buf, u32 len)
    if (fp == NULL || buf == NULL)
       return -1;
 
+   if (fp->pos > save_capacity || len > save_capacity - fp->pos)
+   {
+      save_failed = true;
+      return -1;
+   }
    memcpy(fp->buf + fp->pos, buf, len);
    fp->pos += len;
    return len;
@@ -1301,20 +1356,22 @@ static int save_write(void *file, const void *buf, u32 len)
 static long save_seek(void *file, long offs, int whence)
 {
    struct save_fp *fp = file;
+   size_t origin, distance;
    if (fp == NULL)
       return -1;
-
-   switch (whence)
+   origin = whence == SEEK_SET ? 0 : fp->pos;
+   /* A legal backward seek is used by the dynarec compatibility reader.
+    * Form its magnitude without negating LONG_MIN. */
+   distance = offs < 0 ? (size_t)(-(offs + 1)) + 1 : (size_t)offs;
+   if ((whence != SEEK_SET && whence != SEEK_CUR) || origin > save_capacity ||
+       (offs < 0 ? distance > origin : distance > save_capacity - origin))
    {
-   case SEEK_CUR:
-      fp->pos += offs;
-      return fp->pos;
-   case SEEK_SET:
-      fp->pos = offs;
-      return fp->pos;
-   default:
+      save_failed = true;
       return -1;
    }
+
+   fp->pos = offs < 0 ? origin - distance : origin + distance;
+   return fp->pos;
 }
 
 static void save_close(void *file)
@@ -1329,22 +1386,41 @@ static void save_close(void *file)
    else if (fp->is_write && fp->pos < r_size)
       // make sure we don't save trash in leftover space
       memset(fp->buf + fp->pos, 0, r_size - fp->pos);
-   free(fp);
 }
 
 struct PcsxSaveFuncs SaveFuncs = {
 	save_open, save_read, save_write, save_seek, save_close
 };
 
-bool retro_serialize(void *data, size_t size)
+static bool serialize_memory(void *data, size_t size)
 {
    int ret;
+   if (!data || size < retro_serialize_size())
+      return false;
+   save_capacity = size;
+   save_failed = false;
    CdromFrontendId = disk_current_index;
    ret = SaveState(data);
 
    // old3ds tends to oom here, so log
    log_mem_usage(1);
-   return ret == 0 ? true : false;
+   return ret == 0 && !save_failed;
+}
+
+bool retro_serialize(void *data, size_t size)
+{
+#ifdef GPU_NEON
+   enum retro_savestate_context context = RETRO_SAVESTATE_CONTEXT_NORMAL;
+#endif
+   if (snapshot_restore_failed)
+      return false;
+#ifdef GPU_NEON
+   if (pl_rearmed_cbs.gpu_neon.enhancement_enable &&
+       environ_cb(RETRO_ENVIRONMENT_GET_SAVESTATE_CONTEXT, &context) &&
+       context != RETRO_SAVESTATE_CONTEXT_NORMAL)
+      return false;
+#endif
+   return serialize_memory(data, size);
 }
 
 static bool disk_set_image_index(unsigned int index);
@@ -1352,10 +1428,20 @@ static bool disk_set_image_index(unsigned int index);
 bool retro_unserialize(const void *data, size_t size)
 {
    int ret;
+   if (!data || size < retro_serialize_size())
+      return false;
+   save_capacity = size;
+   save_failed = false;
    CdromFrontendId = -1;
    ret = LoadState(data);
-   if (ret)
+   if (ret || save_failed)
+   {
+      if (ret < -1 || save_failed)
+         snapshot_restore_failed = true;
       return false;
+   }
+   snapshot_invalidate();
+   snapshot_restore_failed = false;
    if (CdromFrontendId != -1 && CdromFrontendId != disk_current_index)
       disk_set_image_index(CdromFrontendId);
    /* a successful restore overrides any reset requested before this call,
@@ -1364,9 +1450,184 @@ bool retro_unserialize(const void *data, size_t size)
    return true;
 }
 
+
+#ifdef GPU_NEON
+struct retro_snapshot {
+   uint64_t generation;
+   size_t gpu_size;
+   unsigned frameskip_counter;
+   int fskip_force, fskip_dirty;
+   bool analog_toggling;
+   unsigned short keystate[PORTS_NUMBER];
+   int analog_left[8][2], analog_right[8][2], mouse[8][2];
+   unsigned char card_flags[2];
+   char cards[2][MCD_SIZE];
+   uint64_t data[1]; /* Keep the following process-local GPU state aligned. */
+};
+
+/* Only ordinary state needs staging. The renderer copy cannot fail after
+ * reservation and queue draining, so no second enhanced image is needed. */
+static bool snapshot_commit_cards(void)
+{
+   char *persisted;
+   char *cards[2] = { Mcd1Data, Mcd2Data };
+   char *paths[2] = { Config.Mcd1, Config.Mcd2 };
+   unsigned i, first, last;
+   bool ok = true;
+   if (!snapshot_staging || snapshot_restore_failed || retro_frame_is_speculative())
+      return false;
+   /* This mirror describes external committed data, so it must not rewind
+    * with the guest. Replay can also cancel an earlier memory-card write. */
+   persisted = (char *)snapshot_staging + retro_serialize_size();
+   for (i = 0; i < 2; i++, persisted += MCD_SIZE)
+   {
+      if (!paths[i][0] || strcmp(paths[i], "none") == 0)
+         continue;
+      if (memcmp(persisted, cards[i], MCD_SIZE))
+      {
+         /* Preserve the existing 128-byte card-write granularity. A replay
+          * can change several sectors, including undoing an earlier write. */
+         for (first = 0; first < MCD_SIZE; first += 128)
+            if (memcmp(persisted + first, cards[i] + first, 128))
+               break;
+         for (last = MCD_SIZE; last > first + 128; last -= 128)
+            if (memcmp(persisted + last - 128, cards[i] + last - 128, 128))
+               break;
+         if (SaveMcdRuntime(paths[i], cards[i], first, last - first))
+            memcpy(persisted + first, cards[i] + first, last - first);
+         else
+            ok = false;
+      }
+   }
+   return ok;
+}
+
+static bool RETRO_CALLCONV snapshot_supported(uint32_t max_live_states)
+{
+   size_t size = GPUsnapshot_size();
+   return snapshot_game_loaded && !reset_pending && size &&
+      max_live_states && max_live_states <= SIZE_MAX /
+      (sizeof(struct retro_snapshot) + retro_serialize_size() + size);
+}
+
+static enum retro_snapshot_result RETRO_CALLCONV snapshot_create(void **out)
+{
+   struct retro_snapshot *state;
+   size_t gpu_size = GPUsnapshot_size();
+   if (!out || *out || !snapshot_supported(1) || snapshot_restore_failed)
+      return snapshot_restore_failed ? RETRO_SNAPSHOT_FATAL : RETRO_SNAPSHOT_UNAVAILABLE;
+   state = malloc(sizeof(*state) + retro_serialize_size() + gpu_size);
+   if (!state)
+      return RETRO_SNAPSHOT_UNAVAILABLE;
+   if (!snapshot_staging)
+   {
+      snapshot_staging = malloc(retro_serialize_size() + 2 * MCD_SIZE);
+      if (snapshot_staging)
+      {
+         char *cards = (char *)snapshot_staging + retro_serialize_size();
+         memcpy(cards, Mcd1Data, MCD_SIZE);
+         memcpy(cards + MCD_SIZE, Mcd2Data, MCD_SIZE);
+      }
+   }
+   if (!snapshot_staging)
+   {
+      free(state);
+      return RETRO_SNAPSHOT_UNAVAILABLE;
+   }
+   state->generation = 0;
+   state->gpu_size = gpu_size;
+   snapshot_owners++;
+   *out = state;
+   return RETRO_SNAPSHOT_SUCCESS;
+}
+
+static bool RETRO_CALLCONV snapshot_valid(const void *data)
+{
+   const struct retro_snapshot *state = data;
+   return state && snapshot_game_loaded && !reset_pending &&
+      state->generation == snapshot_generation &&
+      state->gpu_size == GPUsnapshot_size() &&
+      GPUsnapshot_valid((const char *)state->data + retro_serialize_size());
+}
+
+static enum retro_snapshot_result RETRO_CALLCONV snapshot_save(void *data)
+{
+   struct retro_snapshot *state = data;
+   if (snapshot_restore_failed)
+      return RETRO_SNAPSHOT_FATAL;
+   if (!state || !snapshot_supported(1) || state->gpu_size != GPUsnapshot_size())
+      return RETRO_SNAPSHOT_UNAVAILABLE;
+   GPUsnapshot_sync();
+   if (!serialize_memory(snapshot_staging, retro_serialize_size()))
+      return RETRO_SNAPSHOT_UNAVAILABLE;
+   memcpy(state->data, snapshot_staging, retro_serialize_size());
+   GPUsnapshot_save((char *)state->data + retro_serialize_size());
+   memcpy(state->cards[0], Mcd1Data, MCD_SIZE);
+   memcpy(state->cards[1], Mcd2Data, MCD_SIZE);
+   memcpy(state->card_flags, McdFlag, sizeof(state->card_flags));
+   state->frameskip_counter = frameskip_counter;
+   state->fskip_force = pl_rearmed_cbs.fskip_force;
+   state->fskip_dirty = pl_rearmed_cbs.fskip_dirty;
+   state->analog_toggling = in_dualshock_toggling;
+   memcpy(state->keystate, in_keystate, sizeof(state->keystate));
+   memcpy(state->analog_left, in_analog_left, sizeof(state->analog_left));
+   memcpy(state->analog_right, in_analog_right, sizeof(state->analog_right));
+   memcpy(state->mouse, in_mouse, sizeof(state->mouse));
+   state->generation = snapshot_generation;
+   return RETRO_SNAPSHOT_SUCCESS;
+}
+
+static enum retro_snapshot_result RETRO_CALLCONV snapshot_load(const void *data)
+{
+   const struct retro_snapshot *state = data;
+   if (!snapshot_valid(state))
+      return snapshot_restore_failed ? RETRO_SNAPSHOT_FATAL : RETRO_SNAPSHOT_UNAVAILABLE;
+   /* All storage exists and metadata is validated before live mutation. */
+   GPUsnapshot_sync();
+   save_capacity = retro_serialize_size();
+   save_failed = false;
+   if (LoadStateRuntime((const char *)state->data) || save_failed)
+   {
+      snapshot_restore_failed = true;
+      return RETRO_SNAPSHOT_FATAL;
+   }
+   GPUsnapshot_sync();
+   GPUsnapshot_load((const char *)state->data + retro_serialize_size());
+   memcpy(Mcd1Data, state->cards[0], MCD_SIZE);
+   memcpy(Mcd2Data, state->cards[1], MCD_SIZE);
+   memcpy(McdFlag, state->card_flags, sizeof(state->card_flags));
+   frameskip_counter = state->frameskip_counter;
+   pl_rearmed_cbs.fskip_force = state->fskip_force;
+   pl_rearmed_cbs.fskip_dirty = state->fskip_dirty;
+   /* The toggle combination returns before polling the remaining ports.
+    * Restore their retained samples as well as the edge latch. */
+   in_dualshock_toggling = state->analog_toggling;
+   memcpy(in_keystate, state->keystate, sizeof(state->keystate));
+   memcpy(in_analog_left, state->analog_left, sizeof(state->analog_left));
+   memcpy(in_analog_right, state->analog_right, sizeof(state->analog_right));
+   memcpy(in_mouse, state->mouse, sizeof(state->mouse));
+   reset_pending = false;
+   snapshot_restore_failed = false;
+   return RETRO_SNAPSHOT_SUCCESS;
+}
+
+static void RETRO_CALLCONV snapshot_release(void *data)
+{
+   if (!data)
+      return;
+   free(data);
+   if (--snapshot_owners == 0 && snapshot_commit_cards())
+   {
+      free(snapshot_staging);
+      snapshot_staging = NULL;
+   }
+}
+#endif
+
 /* cheats */
 void retro_cheat_reset(void)
 {
+   snapshot_invalidate();
    ClearAllCheats();
 }
 
@@ -1374,6 +1635,8 @@ void retro_cheat_set(unsigned index, bool enabled, const char *code)
 {
    int ret = -1;
    char *buf;
+
+   snapshot_invalidate();
 
    // cheat funcs are destructive, need a copy...
    buf = strdup(code);
@@ -1483,6 +1746,7 @@ static void disk_init(void)
 
 static bool disk_set_eject_state(bool ejected)
 {
+   snapshot_invalidate();
    if (ejected != disk_ejected)
       SysPrintf("new eject_state: %d\n", ejected);
 
@@ -1520,6 +1784,7 @@ static bool disk_set_image_index(unsigned int index)
    if (index > disk_count)
       return false;
 
+   snapshot_invalidate();
    CdromId[0] = '\0';
    CdromLabel[0] = '\0';
 
@@ -1574,6 +1839,7 @@ static bool disk_replace_image_index(unsigned index,
    if (index >= sizeof(disks) / sizeof(disks[0]))
       return false;
 
+   snapshot_invalidate();
    old_fname  = disks[index].fname;
    old_flabel = disks[index].flabel;
 
@@ -1999,6 +2265,8 @@ bool retro_load_game(const struct retro_game_info *info)
       { 0 },
    };
 
+   snapshot_invalidate();
+   snapshot_game_loaded = false;
    environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, desc);
 
    enum retro_pixel_format fmt = get_bool_variable("pcsx_rearmed_rgb32_output")
@@ -2216,6 +2484,8 @@ bool retro_load_game(const struct retro_game_info *info)
    }
    show_enabled_hacks();
 
+   snapshot_game_loaded = true;
+   snapshot_restore_failed = false;
    return true;
 }
 
@@ -2226,6 +2496,8 @@ unsigned retro_get_region(void)
 
 void *retro_get_memory_data(unsigned id)
 {
+   if (snapshot_restore_failed)
+      return NULL;
    switch (id)
    {
    case RETRO_MEMORY_SYSTEM_RAM:
@@ -2252,6 +2524,11 @@ size_t retro_get_memory_size(unsigned id)
 
 void retro_reset(void)
 {
+   /* The void callback cannot establish recovery. Keep the last anchor and
+    * consumer barrier until a restore or content reload actually succeeds. */
+   if (snapshot_restore_failed)
+      return;
+   snapshot_invalidate();
    //hack to prevent retroarch freezing when reseting in the menu but not while running with the hot key
    reset_pending = true;
    //SysReset();
@@ -2297,6 +2574,8 @@ static void update_variables(bool in_flight)
    frameskip_type_t prev_frameskip_type;
    double old_fps = psxGetFps();
 
+   if (in_flight)
+      snapshot_invalidate();
    var.value = NULL;
    var.key = "pcsx_rearmed_frameskip_type";
 
@@ -3504,12 +3783,15 @@ static void prepare_bios(bool use_hle);
 
 void retro_run(void)
 {
+   if (snapshot_restore_failed && !reset_pending)
+      return;
    //SysReset must be run while core is running,Not in menu (Locks up Retroarch)
    if (reset_pending)
    {
       reset_pending = false;
       prepare_bios(get_bios_config_hle());
       SysReset();
+      snapshot_restore_failed = false;
       if (CheckResetManualExe())
          ;
       else if (Config.HLE)
@@ -3565,6 +3847,13 @@ void retro_run(void)
 
    psxRegs.stop = 0;
    psxCpu->Execute(&psxRegs);
+#ifdef GPU_NEON
+   if (snapshot_commit_cards() && !snapshot_owners)
+   {
+      free(snapshot_staging);
+      snapshot_staging = NULL;
+   }
+#endif
 
    if (pl_rearmed_cbs.fskip_dirty) {
       if (frameskip_counter >= frameskip_interval || !pl_rearmed_cbs.fskip_force)
@@ -4003,11 +4292,30 @@ void retro_init(void)
       libretro_supports_bitmasks = true;
 
    check_system_specs();
+#ifdef GPU_NEON
+   {
+      struct retro_snapshot_interface iface = {
+         RETRO_SNAPSHOT_INTERFACE_VERSION, sizeof(iface),
+         snapshot_supported, snapshot_create, snapshot_save,
+         snapshot_load, snapshot_release, snapshot_valid, NULL
+      };
+      if (environ_cb(RETRO_ENVIRONMENT_SET_SNAPSHOT_INTERFACE, &iface))
+         snapshot_context = iface.get_execution_context;
+   }
+#endif
 }
 
 void retro_deinit(void)
 {
    size_t i;
+
+   snapshot_invalidate();
+   snapshot_game_loaded = false;
+   snapshot_context = NULL;
+#ifdef GPU_NEON
+   free(snapshot_staging);
+   snapshot_staging = NULL;
+#endif
 
    if (plugins_opened)
    {
