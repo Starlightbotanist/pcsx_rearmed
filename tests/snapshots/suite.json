@@ -1,0 +1,8 @@
+{
+  "profile": "neon-2x.cfg",
+  "variants": [
+    {"name": "neon-2x"},
+    {"name": "neon-1x", "options": {"pcsx_rearmed_neon_enhancement_enable": "disabled"}},
+    {"name": "neon-2x-worker", "options": {"pcsx_rearmed_gpu_thread_rendering": "enabled"}}
+  ]
+}
